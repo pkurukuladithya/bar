@@ -1,0 +1,236 @@
+import io
+import sqlite3
+
+import av
+import cv2
+import streamlit as st
+from PIL import Image
+from pyzbar.pyzbar import decode
+import barcode
+from barcode.writer import ImageWriter
+from streamlit_webrtc import (
+    WebRtcMode,
+    VideoProcessorBase,
+    webrtc_streamer,
+)
+
+# =========================
+# Database helpers
+# =========================
+
+DB_PATH = "barcodes.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_item(code: str, name: str, description: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO items (code, name, description)
+        VALUES (?, ?, ?)
+        """,
+        (code, name, description),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_item(code: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, description FROM items WHERE code = ?",
+        (code,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {"name": row[0], "description": row[1]}
+    return None
+
+
+# =========================
+# Barcode helpers
+# =========================
+
+def generate_barcode_png(code: str) -> bytes:
+    """
+    Generate a Code128 barcode PNG as bytes.
+    """
+    CODE128 = barcode.get_barcode_class("code128")
+    barcode_obj = CODE128(code, writer=ImageWriter())
+    buffer = io.BytesIO()
+    barcode_obj.write(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def read_barcodes_from_image_bytes(image_bytes: bytes):
+    """
+    Decode barcodes from image bytes.
+    Returns a list of decoded strings.
+    (Kept here in case you later want file upload scanning.)
+    """
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    decoded = decode(image)
+    return [obj.data.decode("utf-8") for obj in decoded]
+
+
+# =========================
+# Realtime scanner
+# =========================
+
+class BarcodeProcessor(VideoProcessorBase):
+    """
+    Runs on every video frame from the webcam.
+    Draws rectangles around barcodes and stores
+    the last detected code + DB item.
+    """
+
+    def __init__(self):
+        self.last_code = None
+        self.last_item = None
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        # frame: av.VideoFrame -> numpy array (BGR)
+        img = frame.to_ndarray(format="bgr24")
+
+        # Convert to grayscale for decoding
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Decode barcodes
+        decoded_objects = decode(gray)
+
+        for obj in decoded_objects:
+            code = obj.data.decode("utf-8")
+            self.last_code = code
+            self.last_item = get_item(code)
+
+            # Draw rectangle around the barcode
+            x, y, w, h = obj.rect
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # Put the code text on top of the rectangle
+            text = code
+            cv2.putText(
+                img,
+                text,
+                (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Return frame back to browser
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# =========================
+# Streamlit UI
+# =========================
+
+def main():
+    st.set_page_config(page_title="Simple Barcode System", page_icon="📷")
+    st.title("📷 Simple Barcode Generator & Reader")
+
+    init_db()
+
+    mode = st.sidebar.radio("Choose mode", ["Create", "Read"])
+
+    if mode == "Create":
+        show_create_ui()
+    else:
+        show_read_ui()
+
+
+def show_create_ui():
+    st.header("Create Barcode")
+
+    name = st.text_input("Item name")
+    description = st.text_area("Description")
+    code = st.text_input(
+        "Code / Number to encode",
+        help="Can be any text or number (Code128)",
+    )
+
+    if st.button("Generate barcode"):
+        if not name or not code:
+            st.error("Name and code are required.")
+            return
+
+        # Save to DB
+        save_item(code, name, description)
+
+        # Generate barcode PNG
+        png_bytes = generate_barcode_png(code)
+
+        st.subheader("Preview")
+        st.image(png_bytes, caption=f"Barcode for: {code}", use_column_width=False)
+
+        st.download_button(
+            label="⬇️ Download PNG",
+            data=png_bytes,
+            file_name=f"barcode_{code}.png",
+            mime="image/png",
+        )
+
+        st.success("Barcode generated and saved in the system ✅")
+
+
+def show_read_ui():
+    st.header("Read Barcode (Live)")
+
+    st.write(
+        "Show a barcode generated by this system to the camera. "
+        "Detection will happen automatically – no need to take a photo."
+    )
+
+    ctx = webrtc_streamer(
+        key="barcode-reader",
+        mode=WebRtcMode.SENDRECV,          # Browser sends video, receives processed video
+        video_processor_factory=BarcodeProcessor,
+        media_stream_constraints={
+            "video": True,
+            "audio": False,
+        },
+        async_processing=True,
+    )
+
+    if ctx.video_processor:
+        code = ctx.video_processor.last_code
+        item = ctx.video_processor.last_item
+
+        if code:
+            st.subheader("Detected barcode")
+            st.write(f"**Code:** `{code}`")
+
+            if item:
+                st.success("Matched item from system:")
+                st.write(f"**Name:** {item['name']}")
+                st.write(f"**Description:** {item['description']}")
+            else:
+                st.warning("Code not found in database. Only showing raw value.")
+        else:
+            st.info("No barcode detected yet. Move the barcode closer / into the frame.")
+
+
+if __name__ == "__main__":
+    main()
